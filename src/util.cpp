@@ -1,5 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2017 The Bitcoin Core developers
+// Copyright (c) 2009-2018 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -58,6 +58,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <codecvt>
 
 #include <io.h> /* for _commit */
 #include <shlobj.h>
@@ -71,8 +72,6 @@
 #include <malloc.h>
 #endif
 
-#include <boost/interprocess/sync/file_lock.hpp>
-#include <boost/program_options/detail/config_file.hpp>
 #include <boost/thread.hpp>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
@@ -86,8 +85,6 @@ const char * const BITCOIN_CONF_FILENAME = "bitcoin.conf";
 const char * const BITCOIN_PID_FILENAME = "bitcoind.pid";
 
 ArgsManager gArgs;
-
-CTranslationInterface translationInterface;
 
 /** Init OpenSSL library multithreading support */
 static std::unique_ptr<CCriticalSection[]> ppmutexOpenSSL;
@@ -142,7 +139,7 @@ instance_of_cinit;
  * cleans them up and thus automatically unlocks them, or ReleaseDirectoryLocks
  * is called.
  */
-static std::map<std::string, std::unique_ptr<boost::interprocess::file_lock>> dir_locks;
+static std::map<std::string, std::unique_ptr<fsbridge::FileLock>> dir_locks;
 /** Mutex to protect dir_locks. */
 static std::mutex cs_dir_locks;
 
@@ -159,18 +156,13 @@ bool LockDirectory(const fs::path& directory, const std::string lockfile_name, b
     // Create empty lock file if it doesn't exist.
     FILE* file = fsbridge::fopen(pathLockFile, "a");
     if (file) fclose(file);
-
-    try {
-        auto lock = MakeUnique<boost::interprocess::file_lock>(pathLockFile.string().c_str());
-        if (!lock->try_lock()) {
-            return false;
-        }
-        if (!probe_only) {
-            // Lock successful and we're not just probing, put it into the map
-            dir_locks.emplace(pathLockFile.string(), std::move(lock));
-        }
-    } catch (const boost::interprocess::interprocess_exception& e) {
-        return error("Error while attempting to lock directory %s: %s", directory.string(), e.what());
+    auto lock = MakeUnique<fsbridge::FileLock>(pathLockFile);
+    if (!lock->TryLock()) {
+        return error("Error while attempting to lock directory %s: %s", directory.string(), lock->GetReason());
+    }
+    if (!probe_only) {
+        // Lock successful and we're not just probing, put it into the map
+        dir_locks.emplace(pathLockFile.string(), std::move(lock));
     }
     return true;
 }
@@ -225,7 +217,7 @@ public:
 
     /** Determine whether to use config settings in the default section,
      *  See also comments around ArgsManager::ArgsManager() below. */
-    static inline bool UseDefaultSection(const ArgsManager& am, const std::string& arg)
+    static inline bool UseDefaultSection(const ArgsManager& am, const std::string& arg) EXCLUSIVE_LOCKS_REQUIRED(am.cs_args)
     {
         return (am.m_network == CBaseChainParams::MAIN || am.m_network_only_args.count(arg) == 0);
     }
@@ -304,7 +296,7 @@ public:
     /* Special test for -testnet and -regtest args, because we
      * don't want to be confused by craziness like "[regtest] testnet=1"
      */
-    static inline bool GetNetBoolArg(const ArgsManager &am, const std::string& net_arg)
+    static inline bool GetNetBoolArg(const ArgsManager &am, const std::string& net_arg) EXCLUSIVE_LOCKS_REQUIRED(am.cs_args)
     {
         std::pair<bool,std::string> found_result(false,std::string());
         found_result = GetArgHelper(am.m_override_args, net_arg, true);
@@ -381,6 +373,8 @@ ArgsManager::ArgsManager() :
 
 void ArgsManager::WarnForSectionOnlyArgs()
 {
+    LOCK(cs_args);
+
     // if there's no section selected, don't worry
     if (m_network.empty()) return;
 
@@ -409,10 +403,11 @@ void ArgsManager::WarnForSectionOnlyArgs()
 
 void ArgsManager::SelectConfigNetwork(const std::string& network)
 {
+    LOCK(cs_args);
     m_network = network;
 }
 
-void ArgsManager::ParseParameters(int argc, const char* const argv[])
+bool ArgsManager::ParseParameters(int argc, const char* const argv[], std::string& error)
 {
     LOCK(cs_args);
     m_override_args.clear();
@@ -444,7 +439,44 @@ void ArgsManager::ParseParameters(int argc, const char* const argv[])
         } else {
             m_override_args[key].push_back(val);
         }
+
+        // Check that the arg is known
+        if (!(IsSwitchChar(key[0]) && key.size() == 1)) {
+            if (!IsArgKnown(key)) {
+                error = strprintf("Invalid parameter %s", key.c_str());
+                return false;
+            }
+        }
     }
+
+    // we do not allow -includeconf from command line, so we clear it here
+    auto it = m_override_args.find("-includeconf");
+    if (it != m_override_args.end()) {
+        if (it->second.size() > 0) {
+            for (const auto& ic : it->second) {
+                error += "-includeconf cannot be used from commandline; -includeconf=" + ic + "\n";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ArgsManager::IsArgKnown(const std::string& key) const
+{
+    size_t option_index = key.find('.');
+    std::string arg_no_net;
+    if (option_index == std::string::npos) {
+        arg_no_net = key;
+    } else {
+        arg_no_net = std::string("-") + key.substr(option_index + 1, std::string::npos);
+    }
+
+    LOCK(cs_args);
+    for (const auto& arg_map : m_available_args) {
+        if (arg_map.second.count(arg_no_net)) return true;
+    }
+    return false;
 }
 
 std::vector<std::string> ArgsManager::GetArgs(const std::string& strArg) const
@@ -536,9 +568,99 @@ void ArgsManager::ForceSetArg(const std::string& strArg, const std::string& strV
     m_override_args[strArg] = {strValue};
 }
 
+void ArgsManager::AddArg(const std::string& name, const std::string& help, const bool debug_only, const OptionsCategory& cat)
+{
+    // Split arg name from its help param
+    size_t eq_index = name.find('=');
+    if (eq_index == std::string::npos) {
+        eq_index = name.size();
+    }
+
+    LOCK(cs_args);
+    std::map<std::string, Arg>& arg_map = m_available_args[cat];
+    auto ret = arg_map.emplace(name.substr(0, eq_index), Arg(name.substr(eq_index, name.size() - eq_index), help, debug_only));
+    assert(ret.second); // Make sure an insertion actually happened
+}
+
+void ArgsManager::AddHiddenArgs(const std::vector<std::string>& names)
+{
+    for (const std::string& name : names) {
+        AddArg(name, "", false, OptionsCategory::HIDDEN);
+    }
+}
+
+std::string ArgsManager::GetHelpMessage() const
+{
+    const bool show_debug = gArgs.GetBoolArg("-help-debug", false);
+
+    std::string usage = "";
+    LOCK(cs_args);
+    for (const auto& arg_map : m_available_args) {
+        switch(arg_map.first) {
+            case OptionsCategory::OPTIONS:
+                usage += HelpMessageGroup("Options:");
+                break;
+            case OptionsCategory::CONNECTION:
+                usage += HelpMessageGroup("Connection options:");
+                break;
+            case OptionsCategory::ZMQ:
+                usage += HelpMessageGroup("ZeroMQ notification options:");
+                break;
+            case OptionsCategory::DEBUG_TEST:
+                usage += HelpMessageGroup("Debugging/Testing options:");
+                break;
+            case OptionsCategory::NODE_RELAY:
+                usage += HelpMessageGroup("Node relay options:");
+                break;
+            case OptionsCategory::BLOCK_CREATION:
+                usage += HelpMessageGroup("Block creation options:");
+                break;
+            case OptionsCategory::RPC:
+                usage += HelpMessageGroup("RPC server options:");
+                break;
+            case OptionsCategory::WALLET:
+                usage += HelpMessageGroup("Wallet options:");
+                break;
+            case OptionsCategory::WALLET_DEBUG_TEST:
+                if (show_debug) usage += HelpMessageGroup("Wallet debugging/testing options:");
+                break;
+            case OptionsCategory::CHAINPARAMS:
+                usage += HelpMessageGroup("Chain selection options:");
+                break;
+            case OptionsCategory::GUI:
+                usage += HelpMessageGroup("UI Options:");
+                break;
+            case OptionsCategory::COMMANDS:
+                usage += HelpMessageGroup("Commands:");
+                break;
+            case OptionsCategory::REGISTER_COMMANDS:
+                usage += HelpMessageGroup("Register Commands:");
+                break;
+            default:
+                break;
+        }
+
+        // When we get to the hidden options, stop
+        if (arg_map.first == OptionsCategory::HIDDEN) break;
+
+        for (const auto& arg : arg_map.second) {
+            if (show_debug || !arg.second.m_debug_only) {
+                std::string name;
+                if (arg.second.m_help_param.empty()) {
+                    name = arg.first;
+                } else {
+                    name = arg.first + arg.second.m_help_param;
+                }
+                usage += HelpMessageOpt(name, arg.second.m_help_text);
+            }
+        }
+    }
+    return usage;
+}
+
 bool HelpRequested(const ArgsManager& args)
 {
-    return args.IsArgSet("-?") || args.IsArgSet("-h") || args.IsArgSet("-help");
+    return args.IsArgSet("-?") || args.IsArgSet("-h") || args.IsArgSet("-help") || args.IsArgSet("-help-debug");
 }
 
 static const int screenWidth = 79;
@@ -687,48 +809,163 @@ fs::path GetConfigFile(const std::string& confPath)
     return AbsPathForConfigVal(fs::path(confPath), false);
 }
 
-void ArgsManager::ReadConfigStream(std::istream& stream)
+static std::string TrimString(const std::string& str, const std::string& pattern)
+{
+    std::string::size_type front = str.find_first_not_of(pattern);
+    if (front == std::string::npos) {
+        return std::string();
+    }
+    std::string::size_type end = str.find_last_not_of(pattern);
+    return str.substr(front, end - front + 1);
+}
+
+static bool GetConfigOptions(std::istream& stream, std::string& error, std::vector<std::pair<std::string, std::string>> &options)
+{
+    std::string str, prefix;
+    std::string::size_type pos;
+    int linenr = 1;
+    while (std::getline(stream, str)) {
+        if ((pos = str.find('#')) != std::string::npos) {
+            str = str.substr(0, pos);
+        }
+        const static std::string pattern = " \t\r\n";
+        str = TrimString(str, pattern);
+        if (!str.empty()) {
+            if (*str.begin() == '[' && *str.rbegin() == ']') {
+                prefix = str.substr(1, str.size() - 2) + '.';
+            } else if (*str.begin() == '-') {
+                error = strprintf("parse error on line %i: %s, options in configuration file must be specified without leading -", linenr, str);
+                return false;
+            } else if ((pos = str.find('=')) != std::string::npos) {
+                std::string name = prefix + TrimString(str.substr(0, pos), pattern);
+                std::string value = TrimString(str.substr(pos + 1), pattern);
+                options.emplace_back(name, value);
+            } else {
+                error = strprintf("parse error on line %i: %s", linenr, str);
+                if (str.size() >= 2 && str.substr(0, 2) == "no") {
+                    error += strprintf(", if you intended to specify a negated option, use %s=1 instead", str);
+                }
+                return false;
+            }
+        }
+        ++linenr;
+    }
+    return true;
+}
+
+bool ArgsManager::ReadConfigStream(std::istream& stream, std::string& error, bool ignore_invalid_keys)
 {
     LOCK(cs_args);
+    std::vector<std::pair<std::string, std::string>> options;
+    if (!GetConfigOptions(stream, error, options)) {
+        return false;
+    }
+    for (const std::pair<std::string, std::string>& option : options) {
+        std::string strKey = std::string("-") + option.first;
+        std::string strValue = option.second;
 
-    std::set<std::string> setOptions;
-    setOptions.insert("*");
-
-    for (boost::program_options::detail::config_file_iterator it(stream, setOptions), end; it != end; ++it)
-    {
-        std::string strKey = std::string("-") + it->string_key;
-        std::string strValue = it->value[0];
         if (InterpretNegatedOption(strKey, strValue)) {
             m_config_args[strKey].clear();
         } else {
             m_config_args[strKey].push_back(strValue);
         }
+
+        // Check that the arg is known
+        if (!IsArgKnown(strKey)) {
+            if (!ignore_invalid_keys) {
+                error = strprintf("Invalid configuration value %s", option.first.c_str());
+                return false;
+            } else {
+                LogPrintf("Ignoring unknown configuration value %s\n", option.first);
+            }
+        }
     }
+    return true;
 }
 
-void ArgsManager::ReadConfigFile(const std::string& confPath)
+bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
 {
     {
         LOCK(cs_args);
         m_config_args.clear();
     }
 
+    const std::string confPath = GetArg("-conf", BITCOIN_CONF_FILENAME);
     fs::ifstream stream(GetConfigFile(confPath));
 
     // ok to not have a config file
     if (stream.good()) {
-        ReadConfigStream(stream);
+        if (!ReadConfigStream(stream, error, ignore_invalid_keys)) {
+            return false;
+        }
+        // if there is an -includeconf in the override args, but it is empty, that means the user
+        // passed '-noincludeconf' on the command line, in which case we should not include anything
+        bool emptyIncludeConf;
+        {
+            LOCK(cs_args);
+            emptyIncludeConf = m_override_args.count("-includeconf") == 0;
+        }
+        if (emptyIncludeConf) {
+            std::string chain_id = GetChainName();
+            std::vector<std::string> includeconf(GetArgs("-includeconf"));
+            {
+                // We haven't set m_network yet (that happens in SelectParams()), so manually check
+                // for network.includeconf args.
+                std::vector<std::string> includeconf_net(GetArgs(std::string("-") + chain_id + ".includeconf"));
+                includeconf.insert(includeconf.end(), includeconf_net.begin(), includeconf_net.end());
+            }
+
+            // Remove -includeconf from configuration, so we can warn about recursion
+            // later
+            {
+                LOCK(cs_args);
+                m_config_args.erase("-includeconf");
+                m_config_args.erase(std::string("-") + chain_id + ".includeconf");
+            }
+
+            for (const std::string& to_include : includeconf) {
+                fs::ifstream include_config(GetConfigFile(to_include));
+                if (include_config.good()) {
+                    if (!ReadConfigStream(include_config, error, ignore_invalid_keys)) {
+                        return false;
+                    }
+                    LogPrintf("Included configuration file %s\n", to_include.c_str());
+                } else {
+                    error = "Failed to include configuration file " + to_include;
+                    return false;
+                }
+            }
+
+            // Warn about recursive -includeconf
+            includeconf = GetArgs("-includeconf");
+            {
+                std::vector<std::string> includeconf_net(GetArgs(std::string("-") + chain_id + ".includeconf"));
+                includeconf.insert(includeconf.end(), includeconf_net.begin(), includeconf_net.end());
+                std::string chain_id_final = GetChainName();
+                if (chain_id_final != chain_id) {
+                    // Also warn about recursive includeconf for the chain that was specified in one of the includeconfs
+                    includeconf_net = GetArgs(std::string("-") + chain_id_final + ".includeconf");
+                    includeconf.insert(includeconf.end(), includeconf_net.begin(), includeconf_net.end());
+                }
+            }
+            for (const std::string& to_include : includeconf) {
+                fprintf(stderr, "warning: -includeconf cannot be used from included files; ignoring -includeconf=%s\n", to_include.c_str());
+            }
+        }
     }
 
     // If datadir is changed in .conf file:
     ClearDatadirCache();
     if (!fs::is_directory(GetDataDir(false))) {
-        throw std::runtime_error(strprintf("specified data directory \"%s\" does not exist.", gArgs.GetArg("-datadir", "").c_str()));
+        error = strprintf("specified data directory \"%s\" does not exist.", gArgs.GetArg("-datadir", "").c_str());
+        return false;
     }
+    return true;
 }
 
 std::string ArgsManager::GetChainName() const
 {
+    LOCK(cs_args);
     bool fRegTest = ArgsManagerHelper::GetNetBoolArg(*this, "-regtest");
     bool fTestNet = ArgsManagerHelper::GetNetBoolArg(*this, "-testnet");
 
@@ -761,7 +998,7 @@ void CreatePidFile(const fs::path &path, pid_t pid)
 bool RenameOver(fs::path src, fs::path dest)
 {
 #ifdef WIN32
-    return MoveFileExA(src.string().c_str(), dest.string().c_str(),
+    return MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
                        MOVEFILE_REPLACE_EXISTING) != 0;
 #else
     int rc = std::rename(src.string().c_str(), dest.string().c_str());
@@ -806,7 +1043,7 @@ bool FileCommit(FILE *file)
         LogPrintf("%s: fdatasync failed: %d\n", __func__, errno);
         return false;
     }
-    #elif defined(__APPLE__) && defined(F_FULLFSYNC)
+    #elif defined(MAC_OSX) && defined(F_FULLFSYNC)
     if (fcntl(fileno(file), F_FULLFSYNC, 0) == -1) { // Manpage says "value other than -1" is returned on success
         LogPrintf("%s: fcntl F_FULLFSYNC failed: %d\n", __func__, errno);
         return false;
@@ -887,7 +1124,9 @@ void AllocateFileRange(FILE *file, unsigned int offset, unsigned int length) {
     // Fallback version
     // TODO: just write one byte per block
     static const char buf[65536] = {};
-    fseek(file, offset, SEEK_SET);
+    if (fseek(file, offset, SEEK_SET)) {
+        return;
+    }
     while (length > 0) {
         unsigned int now = 65536;
         if (length < now)
@@ -901,14 +1140,14 @@ void AllocateFileRange(FILE *file, unsigned int offset, unsigned int length) {
 #ifdef WIN32
 fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
 {
-    char pszPath[MAX_PATH] = "";
+    WCHAR pszPath[MAX_PATH] = L"";
 
-    if(SHGetSpecialFolderPathA(nullptr, pszPath, nFolder, fCreate))
+    if(SHGetSpecialFolderPathW(nullptr, pszPath, nFolder, fCreate))
     {
         return fs::path(pszPath);
     }
 
-    LogPrintf("SHGetSpecialFolderPathA() failed, could not obtain requested path.\n");
+    LogPrintf("SHGetSpecialFolderPathW() failed, could not obtain requested path.\n");
     return fs::path("");
 }
 #endif
@@ -916,7 +1155,11 @@ fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
 void runCommand(const std::string& strCommand)
 {
     if (strCommand.empty()) return;
+#ifndef WIN32
     int nErr = ::system(strCommand.c_str());
+#else
+    int nErr = ::_wsystem(std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>,wchar_t>().from_bytes(strCommand).c_str());
+#endif
     if (nErr)
         LogPrintf("runCommand error: system(%s) returned %d\n", strCommand, nErr);
 }
@@ -1005,7 +1248,7 @@ fs::path AbsPathForConfigVal(const fs::path& path, bool net_specific)
     return fs::absolute(path, GetDataDir(net_specific));
 }
 
-int ScheduleBatchPriority(void)
+int ScheduleBatchPriority()
 {
 #ifdef SCHED_BATCH
     const static sched_param param{0};

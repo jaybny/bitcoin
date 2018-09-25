@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2015 The Bitcoin Core developers
+// Copyright (c) 2011-2018 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -83,10 +83,10 @@ public:
     OutputType GetDefaultAddressType() const;
 
 private:
-    WalletModel *walletModel;
-    AddressTablePriv *priv;
+    WalletModel* const walletModel;
+    AddressTablePriv *priv = nullptr;
     QStringList columns;
-    EditStatus editStatus;
+    EditStatus editStatus = OK;
 
     /** Look up address book data given an address string. */
     bool getAddressData(const QString &address, std::string* name, std::string* purpose) const;
